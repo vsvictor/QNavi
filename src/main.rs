@@ -1,4 +1,4 @@
-use std::{fs::File, io::BufReader, net::SocketAddr, sync::Arc, path::Path};
+use std::{fs::File, io::BufReader, net::SocketAddr, sync::Arc, path::Path, time::Duration};
 
 use anyhow::{anyhow, Result};
 use tracing::{error, info};
@@ -58,7 +58,17 @@ async fn main() -> Result<()> {
     // Configure transport
     let mut transport_config = quinn::TransportConfig::default();
     use quinn_proto::VarInt;
+    // concurrent streams
     transport_config.max_concurrent_bidi_streams(VarInt::from_u32(100));
+
+    // max_idle_timeout expects Option<quinn_proto::IdleTimeout>, which implements From<VarInt>.
+    // Convert desired timeout (Duration) into milliseconds and pass as VarInt.
+    // Here we set 600 seconds = 600_000 milliseconds.
+    let idle_timeout_ms: u32 = (Duration::from_secs(600).as_millis())
+        .try_into()
+        .unwrap_or(u32::MAX);
+    transport_config.max_idle_timeout(Some(quinn_proto::IdleTimeout::from(VarInt::from_u32(idle_timeout_ms))));
+
     server_config.transport = Arc::new(transport_config);
 
     // Build endpoint

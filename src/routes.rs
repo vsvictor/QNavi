@@ -10,6 +10,7 @@ use uuid::Uuid;
 use chrono::{Utc, DateTime};
 
 use h3::server::{RequestResolver, RequestStream};
+use tracing::info;
 
 #[derive(Clone)]
 pub struct Router {
@@ -43,6 +44,25 @@ impl Router {
     pub fn new() -> Self {
         Self {
             store: Arc::new(RwLock::new(Store::default())),
+        }
+    }
+
+    /// Helper: parse JSON body into T; on error return a 400 Response
+    fn parse_json_bad_request<'a, T>(body: &'a str) -> Result<T, Response<String>>
+    where
+        T: serde::de::Deserialize<'a>,
+    {
+        match serde_json::from_str::<T>(body) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                let msg = json!({ "error": "invalid request body", "details": e.to_string() }).to_string();
+                let resp = Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header("content-type", "application/json")
+                    .body(msg)
+                    .unwrap();
+                Err(resp)
+            }
         }
     }
 
@@ -103,7 +123,11 @@ impl Router {
         #[derive(Deserialize)]
         struct Req { username: String, password: String }
 
-        let req: Req = serde_json::from_str(body)?;
+        let req: Req = match Self::parse_json_bad_request::<Req>(body) {
+            Ok(r) => r,
+            Err(resp) => return Ok(resp),
+        };
+
         // Very naive uniqueness check
         let mut store = self.store.write();
         if store.users.iter().any(|u| u.username == req.username) {
@@ -123,6 +147,7 @@ impl Router {
             "id": user.id.to_string(),
             "username": user.username
         }).to_string();
+        info!("Created user from json {}", body);
         Ok(Response::builder()
             .status(StatusCode::CREATED)
             .header("content-type", "application/json")
@@ -133,7 +158,11 @@ impl Router {
         #[derive(Deserialize)]
         struct Req { username: String, password: String }
 
-        let req: Req = serde_json::from_str(body)?;
+        let req: Req = match Self::parse_json_bad_request::<Req>(body) {
+            Ok(r) => r,
+            Err(resp) => return Ok(resp),
+        };
+
         let mut store = self.store.write();
         if let Some(user) = store.users.iter().find(|u| u.username == req.username && u.password == req.password) {
             // Create session token (naive)
@@ -150,6 +179,7 @@ impl Router {
                 .header("content-type", "application/json")
                 .body(body)?);
         }
+        info!("User token:{}", body);
         Ok(Response::builder()
             .status(StatusCode::UNAUTHORIZED)
             .header("content-type", "application/json")
@@ -158,11 +188,26 @@ impl Router {
 
     async fn route_refresh(&self, body: &str) -> Result<Response<String>> {
         #[derive(Deserialize)]
-        struct Req { token: String }
+        struct Req { token: Option<String> }
 
-        let req: Req = serde_json::from_str(body)?;
+        let req: Req = match Self::parse_json_bad_request::<Req>(body) {
+            Ok(r) => r,
+            Err(resp) => return Ok(resp),
+        };
+
+        // If token missing, return 400 Bad Request with explanatory message.
+        let token = match req.token {
+            Some(t) => t,
+            None => {
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header("content-type", "application/json")
+                    .body(json!({"error": "missing field", "field": "token"}).to_string())?);
+            }
+        };
+
         let mut store = self.store.write();
-        if let Some(sess) = store.sessions.iter_mut().find(|s| s.token == req.token) {
+        if let Some(sess) = store.sessions.iter_mut().find(|s| s.token == token) {
             // extend expiry
             sess.expires_at = Utc::now() + chrono::Duration::hours(24);
             let body = json!({"token": sess.token, "expires_at": sess.expires_at}).to_string();
