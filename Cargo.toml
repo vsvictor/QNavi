@@ -1,0 +1,9 @@
+[package]
+name = "QNavi"
+version = "0.1.0"
+edition = "2021"
+authors = ["vsvictor <victor74@gmail.com>"]
+description = "QNavi — Rest API HTTP3/QUIC на Rust"
+license = "MIT OR Apache-2.0"
+
+[dependencies]

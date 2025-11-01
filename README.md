@@ -1,2 +1,10 @@
+```markdown
 # QNavi
-Rust backend for ARNavi
+
+Початковий пустий проєкт на Rust.
+
+Запуск:
+```bash
+cargo run
+```
+```
