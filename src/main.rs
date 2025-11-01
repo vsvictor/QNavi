@@ -115,7 +115,9 @@ async fn handle_request(
     let (response, body) = match (method, path) {
         (&Method::GET, "/api/items") => handle_list_items(store).await,
         (&Method::GET, path) if path.starts_with("/api/items/") => {
-            let id = path.strip_prefix("/api/items/").unwrap();
+            let id = path
+                .strip_prefix("/api/items/")
+                .expect("Path should start with /api/items/");
             handle_get_item(store, id).await
         }
         (&Method::POST, "/api/items") => {
@@ -123,12 +125,16 @@ async fn handle_request(
             handle_create_item(store, body).await
         }
         (&Method::PUT, path) if path.starts_with("/api/items/") => {
-            let id = path.strip_prefix("/api/items/").unwrap();
+            let id = path
+                .strip_prefix("/api/items/")
+                .expect("Path should start with /api/items/");
             let body = read_body(&mut stream).await?;
             handle_update_item(store, id, body).await
         }
         (&Method::DELETE, path) if path.starts_with("/api/items/") => {
-            let id = path.strip_prefix("/api/items/").unwrap();
+            let id = path
+                .strip_prefix("/api/items/")
+                .expect("Path should start with /api/items/");
             handle_delete_item(store, id).await
         }
         _ => {
@@ -165,8 +171,8 @@ async fn read_body(
 
 async fn handle_list_items(store: DataStore) -> (Response<()>, String) {
     let items = store.read().await;
-    let body = serde_json::to_value(&*items).unwrap();
-    let json_str = serde_json::to_string(&body).unwrap();
+    let body = serde_json::to_value(&*items).expect("Failed to serialize items");
+    let json_str = serde_json::to_string(&body).expect("Failed to serialize JSON");
     let response = build_json_response(StatusCode::OK, json_str.len());
     (response, json_str)
 }
@@ -174,8 +180,8 @@ async fn handle_list_items(store: DataStore) -> (Response<()>, String) {
 async fn handle_get_item(store: DataStore, id: &str) -> (Response<()>, String) {
     let items = store.read().await;
     if let Some(item) = items.iter().find(|i| i.id == id) {
-        let body = serde_json::to_value(item).unwrap();
-        let json_str = serde_json::to_string(&body).unwrap();
+        let body = serde_json::to_value(item).expect("Failed to serialize item");
+        let json_str = serde_json::to_string(&body).expect("Failed to serialize JSON");
         let response = build_json_response(StatusCode::OK, json_str.len());
         (response, json_str)
     } else {
@@ -183,7 +189,7 @@ async fn handle_get_item(store: DataStore, id: &str) -> (Response<()>, String) {
             "error": "Not Found",
             "message": format!("Item with id '{}' not found", id)
         });
-        let json_str = serde_json::to_string(&body).unwrap();
+        let json_str = serde_json::to_string(&body).expect("Failed to serialize JSON");
         let response = build_json_response(StatusCode::NOT_FOUND, json_str.len());
         (response, json_str)
     }
@@ -193,9 +199,9 @@ async fn handle_create_item(store: DataStore, body: Vec<u8>) -> (Response<()>, S
     match serde_json::from_slice::<Item>(&body) {
         Ok(item) => {
             let mut items = store.write().await;
-            items.push(item.clone());
-            let body = serde_json::to_value(&item).unwrap();
-            let json_str = serde_json::to_string(&body).unwrap();
+            let body = serde_json::to_value(&item).expect("Failed to serialize item");
+            items.push(item);
+            let json_str = serde_json::to_string(&body).expect("Failed to serialize JSON");
             let response = build_json_response(StatusCode::CREATED, json_str.len());
             (response, json_str)
         }
@@ -204,7 +210,7 @@ async fn handle_create_item(store: DataStore, body: Vec<u8>) -> (Response<()>, S
                 "error": "Bad Request",
                 "message": "Invalid JSON body"
             });
-            let json_str = serde_json::to_string(&body).unwrap();
+            let json_str = serde_json::to_string(&body).expect("Failed to serialize JSON");
             let response = build_json_response(StatusCode::BAD_REQUEST, json_str.len());
             (response, json_str)
         }
@@ -216,9 +222,10 @@ async fn handle_update_item(store: DataStore, id: &str, body: Vec<u8>) -> (Respo
         Ok(updated_item) => {
             let mut items = store.write().await;
             if let Some(item) = items.iter_mut().find(|i| i.id == id) {
-                *item = updated_item.clone();
-                let body = serde_json::to_value(&updated_item).unwrap();
-                let json_str = serde_json::to_string(&body).unwrap();
+                let body =
+                    serde_json::to_value(&updated_item).expect("Failed to serialize item");
+                *item = updated_item;
+                let json_str = serde_json::to_string(&body).expect("Failed to serialize JSON");
                 let response = build_json_response(StatusCode::OK, json_str.len());
                 (response, json_str)
             } else {
@@ -226,7 +233,7 @@ async fn handle_update_item(store: DataStore, id: &str, body: Vec<u8>) -> (Respo
                     "error": "Not Found",
                     "message": format!("Item with id '{}' not found", id)
                 });
-                let json_str = serde_json::to_string(&body).unwrap();
+                let json_str = serde_json::to_string(&body).expect("Failed to serialize JSON");
                 let response = build_json_response(StatusCode::NOT_FOUND, json_str.len());
                 (response, json_str)
             }
@@ -236,7 +243,7 @@ async fn handle_update_item(store: DataStore, id: &str, body: Vec<u8>) -> (Respo
                 "error": "Bad Request",
                 "message": "Invalid JSON body"
             });
-            let json_str = serde_json::to_string(&body).unwrap();
+            let json_str = serde_json::to_string(&body).expect("Failed to serialize JSON");
             let response = build_json_response(StatusCode::BAD_REQUEST, json_str.len());
             (response, json_str)
         }
@@ -250,7 +257,7 @@ async fn handle_delete_item(store: DataStore, id: &str) -> (Response<()>, String
         let body = serde_json::json!({
             "message": format!("Item with id '{}' deleted successfully", id)
         });
-        let json_str = serde_json::to_string(&body).unwrap();
+        let json_str = serde_json::to_string(&body).expect("Failed to serialize JSON");
         let response = build_json_response(StatusCode::OK, json_str.len());
         (response, json_str)
     } else {
@@ -258,7 +265,7 @@ async fn handle_delete_item(store: DataStore, id: &str) -> (Response<()>, String
             "error": "Not Found",
             "message": format!("Item with id '{}' not found", id)
         });
-        let json_str = serde_json::to_string(&body).unwrap();
+        let json_str = serde_json::to_string(&body).expect("Failed to serialize JSON");
         let response = build_json_response(StatusCode::NOT_FOUND, json_str.len());
         (response, json_str)
     }
