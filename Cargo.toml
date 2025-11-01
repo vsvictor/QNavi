@@ -2,9 +2,6 @@
 name = "QNavi"
 version = "0.1.0"
 edition = "2021"
-authors = ["vsvictor <victor74@gmail.com>"]
-description = "QNavi — Rest API HTTP3/QUIC на Rust"
-license = "MIT OR Apache-2.0"
 
 [dependencies]
 # h3 workspace
@@ -15,19 +12,24 @@ h3-quinn = { git = "https://github.com/hyperium/h3.git", package = "h3-quinn" }
 quinn = "0.11"
 quinn-proto = "0.11"
 
-# Core crates (align with h3/h3-quinn)
+# Core crates
 http = "1.3"
 bytes = "1"
 
-# Tokio, tracing, etc.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util"], default-features = false }
 
 tracing = "0.1"
-# Enable env-filter feature for tracing-subscriber so EnvFilter is exported
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "std"] }
 
 anyhow = "1"
 rcgen = "0.9"
+
+# PEM parsing and pki wrappers
+rustls-pemfile = "1.0"
+rustls-pki-types = "1.13"
+
+# dotenv for .env support (reads CERT_PATH, KEY_PATH)
+dotenvy = "0.15"
 
 # Serde + uuid + chrono
 serde = { version = "1.0", features = ["derive"] }
@@ -36,7 +38,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 parking_lot = "0.12"
-rustls-pki-types = "1.13.0"
 
 [profile.dev]
 overflow-checks = true
