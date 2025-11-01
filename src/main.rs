@@ -29,7 +29,7 @@ async fn main() -> Result<()> {
     let (cert_chain_vec, key_der_vec) = cert_key;
 
     // Convert to rustls-pki-types wrappers expected by quinn-proto
-    use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer};
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
     // Certificates: CertificateDer::from(Vec<u8>)
     let cert_chain: Vec<CertificateDer<'static>> = cert_chain_vec
@@ -101,7 +101,7 @@ fn load_certificates_and_key_from_env() -> Result<(Vec<Vec<u8>>, Vec<u8>)> {
         Ok(p) if !p.is_empty() => p,
         _ => return Err(anyhow!("KEY_PATH not set")),
     };
-
+    info!("Certificates and private key loaded");
     let certs = load_certs_from_pem(&cert_path)?;
     let key = load_key_from_pem(&key_path)?;
 
