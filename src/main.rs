@@ -38,8 +38,22 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Create router with secret
-    let router = Arc::new(Router::new_with_secret(secret_key));
+    // Prepare Redis connection (read REDIS_URL from env, default to local)
+    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
+    info!("Connecting to Redis at {}", redis_url);
+    let redis_client = redis::Client::open(redis_url.as_str())
+        .map_err(|e| anyhow!("failed to create redis client: {:?}", e))?;
+
+    // Create a multiplexed tokio connection (redis 0.32.x)
+    let multiplexed = redis::Client::get_multiplexed_tokio_connection(&redis_client)
+        .await
+        .map_err(|e| anyhow!("failed to create redis multiplexed connection: {:?}", e))?;
+
+    // Wrap in Mutex and Arc to match Router API (Arc<Mutex<MultiplexedConnection>>)
+    let redis_arc = Arc::new(tokio::sync::Mutex::new(multiplexed));
+
+    // Create router with secret and redis
+    let router = Arc::new(Router::new_with_secret_and_redis(secret_key, redis_arc.clone()));
 
     // Try to load cert/key from .env-specified PEM files; fallback to generated self-signed.
     let cert_key = load_certificates_and_key_from_env().or_else(|_| {

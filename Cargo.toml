@@ -45,6 +45,9 @@ parking_lot = "0.12"
 hex = "0.4.3"
 base64 = "0.21.7"
 
+# Redis async client (tokio)
+redis = { version = "0.32.7", features = ["tokio-comp"] }
+
 [profile.dev]
 overflow-checks = true
 opt-level = 0

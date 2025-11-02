@@ -18,19 +18,34 @@ use rand::rngs::OsRng;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 
+// Redis
+use redis::AsyncCommands;
+use redis::aio::MultiplexedConnection;
+use tokio::sync::Mutex;
+
+/// Redis-stored session structure (serialized as JSON)
+#[derive(Debug, Serialize, Deserialize)]
+struct RedisSession {
+    token: String,
+    user_id: String,
+    expires_at: String, // ISO string
+}
+
 #[derive(Clone)]
 pub struct Router {
-    // Simple in-memory store
+    // Simple in-memory store for users only
     store: Arc<RwLock<Store>>,
     jwt_secret: Arc<Vec<u8>>,
     access_token_ttl_seconds: i64,
     refresh_token_ttl_seconds: i64,
+    // Redis multiplexed connection for sessions wrapped in a Mutex so we can use &mut APIs
+    redis: Arc<Mutex<MultiplexedConnection>>,
 }
 
 #[derive(Default)]
 struct Store {
     users: Vec<User>,
-    sessions: Vec<Session>, // stores refresh tokens
+    // sessions moved to Redis
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -40,14 +55,6 @@ struct User {
     // In production — store password hashes
     password: String,
     created_at: DateTime<Utc>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct Session {
-    refresh_jti: String, // unique id for refresh JWT (jti)
-    token: String,       // refresh token JWT
-    user_id: Uuid,
-    expires_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -67,12 +74,13 @@ struct RefreshClaims {
 }
 
 impl Router {
-    pub fn new_with_secret(secret: Vec<u8>) -> Self {
+    pub fn new_with_secret_and_redis(secret: Vec<u8>, redis: Arc<Mutex<MultiplexedConnection>>) -> Self {
         Self {
             store: Arc::new(RwLock::new(Store::default())),
             jwt_secret: Arc::new(secret),
             access_token_ttl_seconds: 60 * 15,    // 15 minutes
             refresh_token_ttl_seconds: 60 * 60 * 24 * 30, // 30 days
+            redis,
         }
     }
 
@@ -161,13 +169,13 @@ impl Router {
         stream.finish().await?;
 
         // Log returned JSON
-        info!(response = %response.into_body(), "Return JSON");
+        debug!(response = %response.into_body(), "Return JSON");
 
         Ok(())
     }
 
-    // Helper: create JWT access + refresh tokens and persist refresh session
-    fn create_tokens_for_user(&self, user_id: Uuid) -> Result<(String, String)> {
+    // Helper: create JWT access + refresh tokens and persist refresh session into Redis
+    async fn create_tokens_for_user(&self, user_id: Uuid) -> Result<(String, String)> {
         let now = Utc::now();
         let iat = now.timestamp() as usize;
         let access_exp = (now + ChronoDuration::seconds(self.access_token_ttl_seconds)).timestamp() as usize;
@@ -209,16 +217,21 @@ impl Router {
         let refresh_elapsed = start_refresh.elapsed();
         debug!("refresh token signed in {} ms", refresh_elapsed.as_millis());
 
-        // Persist refresh session — hold write lock only briefly
-        {
-            let mut store = self.store.write();
-            store.sessions.push(Session {
-                refresh_jti: jti.clone(),
-                token: refresh_token.clone(),
-                user_id,
-                expires_at: (now + ChronoDuration::seconds(self.refresh_token_ttl_seconds)),
-            });
-        }
+        // Persist refresh session into Redis — key: refresh:<jti>
+        let session = RedisSession {
+            token: refresh_token.clone(),
+            user_id: user_id.to_string(),
+            expires_at: (now + ChronoDuration::seconds(self.refresh_token_ttl_seconds)).to_rfc3339(),
+        };
+        let key = format!("refresh:{}", jti);
+        let value = serde_json::to_string(&session)?;
+        // Set with expiry (seconds)
+        let ttl_secs = self.refresh_token_ttl_seconds as u64;
+
+        // Lock the multiplexed connection to get mutable access for AsyncCommands
+        let mut conn = self.redis.lock().await;
+        // set_ex expects u64 for seconds
+        let _: () = conn.set_ex(key, value, ttl_secs).await?;
 
         // warn if entire generation slow
         let total = access_elapsed + rng_elapsed + refresh_elapsed;
@@ -283,12 +296,11 @@ impl Router {
         };
 
         if let Some(user) = maybe_user {
-            debug!("route_login: user found, creating tokens (sync)");
+            debug!("route_login: user found, creating tokens (async)");
             // Measure time
             let start = std::time::Instant::now();
 
-            // Synchronous creation (should be fast). Avoid spawn_blocking unless you observe heavy CPU work.
-            match self.create_tokens_for_user(user.id) {
+            match self.create_tokens_for_user(user.id).await {
                 Ok((access_token, refresh_token)) => {
                     let elapsed = start.elapsed();
                     if elapsed.as_millis() > 200 {
@@ -322,7 +334,6 @@ impl Router {
     }
 
     async fn route_refresh(&self, body: &str) -> Result<Response<String>> {
-        info!("Input data:{}", body);
         #[derive(Deserialize)]
         struct Req { refresh_token: Option<String> }
 
@@ -333,7 +344,7 @@ impl Router {
 
         let rt = match req.refresh_token {
             Some(t) => {
-                info!("Refresh token: {}", t);
+                debug!("Refresh token: {}", t);
                 t
             },
             None => {
@@ -388,42 +399,60 @@ impl Router {
             }
         };
 
-        // --- IMPORTANT: avoid holding write lock while generating tokens ---
-        // Find the session and check expiry under lock, but copy out the minimal data then drop lock.
-        let (found_user_id, found_jti) = {
-            let store = self.store.read();
-            match store.sessions.iter().find(|s| s.refresh_jti == token_data.claims.jti && s.token == rt) {
-                Some(sess) => {
-                    if sess.expires_at <= Utc::now() {
-                        // expired; will remove below under write lock
-                        (None, None)
-                    } else {
-                        (Some(sess.user_id), Some(sess.refresh_jti.clone()))
+        // Look up session in Redis by jti and validate stored token matches provided rt
+        let jti = token_data.claims.jti.clone();
+        let key = format!("refresh:{}", jti);
+        let mut conn = self.redis.lock().await;
+        let stored_json: Option<String> = conn.get(&key).await?;
+        let stored = match stored_json {
+            Some(s) => {
+                match serde_json::from_str::<RedisSession>(&s) {
+                    Ok(sess) => sess,
+                    Err(_) => {
+                        // malformed data -> remove key and respond unauthorized
+                        let _: () = conn.del(&key).await.unwrap_or(());
+                        return Ok(Response::builder()
+                            .status(StatusCode::UNAUTHORIZED)
+                            .header("content-type", "application/json")
+                            .body(json!({"error":"invalid refresh session"}).to_string())?);
                     }
                 }
-                None => (None, None),
             }
-        };
-
-        // If not found or expired -> respond
-        let user_id = match found_user_id {
-            Some(uid) => uid,
             None => {
-                // If expired, remove expired matching jti (best-effort)
-                let _ = {
-                    let mut store = self.store.write();
-                    store.sessions.retain(|s| s.refresh_jti != token_data.claims.jti);
-                };
                 return Ok(Response::builder()
                     .status(StatusCode::UNAUTHORIZED)
                     .header("content-type", "application/json")
                     .body(json!({"error":"invalid refresh session"}).to_string())?);
             }
         };
-        let old_jti = found_jti.unwrap();
 
-        // Now generate new tokens OUTSIDE the lock
-        let (new_access, new_refresh) = match self.create_tokens_for_user(user_id) {
+        // Ensure the stored token matches provided token (defensive)
+        if stored.token != rt {
+            // possible token reuse or mismatch
+            // for safety, delete stored session
+            let _: () = conn.del(&key).await.unwrap_or(());
+            return Ok(Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header("content-type", "application/json")
+                .body(json!({"error":"invalid refresh session"}).to_string())?);
+        }
+
+        // parse user id
+        let user_id = match Uuid::parse_str(&stored.user_id) {
+            Ok(u) => u,
+            Err(_) => {
+                let _: () = conn.del(&key).await.unwrap_or(());
+                return Ok(Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .header("content-type", "application/json")
+                    .body(json!({"error":"invalid refresh session"}).to_string())?);
+            }
+        };
+
+        // Now generate new tokens OUTSIDE any lock
+        // Drop lock first to avoid holding Redis connection during token generation
+        drop(conn);
+        let (new_access, new_refresh) = match self.create_tokens_for_user(user_id).await {
             Ok(t) => t,
             Err(e) => {
                 tracing::error!("Failed to create rotated tokens: {:?}", e);
@@ -434,45 +463,9 @@ impl Router {
             }
         };
 
-        // Re-acquire write lock briefly to remove old session and ensure new session is stored
-        {
-            let mut store = self.store.write();
-            // Remove old session(s) matching old_jti (defensive)
-            store.sessions.retain(|s| s.refresh_jti != old_jti);
-            // Add new session that was appended inside create_tokens_for_user already.
-            // Note: create_tokens_for_user already appends a session with the new refresh_jti.
-            // But to be robust in case of race or different behavior, ensure new token is present:
-            // (we check presence and push if missing)
-            let new_refresh_jti = match new_refresh.split('.').collect::<Vec<&str>>().as_slice() {
-                [_, payload_b64, _] => {
-                    if let Ok(payload_bytes) = URL_SAFE_NO_PAD.decode(payload_b64) {
-                        if let Ok(claims) = serde_json::from_slice::<RefreshClaims>(&payload_bytes) {
-                            Some(claims.jti)
-                        } else { None }
-                    } else { None }
-                }
-                _ => None,
-            };
-            if let Some(jti) = new_refresh_jti {
-                if !store.sessions.iter().any(|s| s.refresh_jti == jti) {
-                    // add
-                    store.sessions.push(Session {
-                        refresh_jti: jti.clone(),
-                        token: new_refresh.clone(),
-                        user_id,
-                        expires_at: Utc::now() + ChronoDuration::seconds(self.refresh_token_ttl_seconds),
-                    });
-                }
-            } else {
-                // fallback: push without jti (shouldn't happen)
-                store.sessions.push(Session {
-                    refresh_jti: format!("rt-{}", Uuid::new_v4()),
-                    token: new_refresh.clone(),
-                    user_id,
-                    expires_at: Utc::now() + ChronoDuration::seconds(self.refresh_token_ttl_seconds),
-                });
-            }
-        }
+        // Re-acquire connection to remove old session (we already created new one inside create_tokens_for_user)
+        let mut conn = self.redis.lock().await;
+        let _: () = conn.del(&key).await.unwrap_or(());
 
         let body = json!({ "access_token": new_access, "refresh_token": new_refresh }).to_string();
         info!("New tokens issued");
@@ -513,11 +506,12 @@ impl Router {
             }
         };
 
+        let jti = token_data.claims.jti;
+        let key = format!("refresh:{}", jti);
+        let mut conn = self.redis.lock().await;
         // remove session
-        let mut store = self.store.write();
-        let initial_len = store.sessions.len();
-        store.sessions.retain(|s| s.refresh_jti != token_data.claims.jti);
-        if store.sessions.len() < initial_len {
+        let deleted: i64 = conn.del(&key).await?;
+        if deleted > 0 {
             return Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "application/json")
