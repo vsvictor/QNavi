@@ -18,6 +18,10 @@ use rand::rngs::OsRng;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 
+// Argon2 password hashing
+use argon2::{Argon2, PasswordHasher, PasswordVerifier};
+use argon2::password_hash::{SaltString, PasswordHash, rand_core::OsRng as PHOsRng};
+
 // Redis
 use redis::AsyncCommands;
 use redis::aio::MultiplexedConnection;
@@ -52,7 +56,7 @@ struct Store {
 struct User {
     id: Uuid,
     username: String,
-    // In production — store password hashes
+    // store password hash (Argon2) instead of plaintext
     password: String,
     created_at: DateTime<Utc>,
 }
@@ -90,6 +94,29 @@ impl Router {
 
     fn decoding_key(&self) -> DecodingKey {
         DecodingKey::from_secret(&self.jwt_secret)
+    }
+
+    /// Hash a plaintext password with Argon2 and return the encoded hash string
+    fn hash_password(&self, password: &str) -> Result<String> {
+        // Generate a random salt
+        let salt = SaltString::generate(&mut PHOsRng);
+        // Argon2 default parameters (Argon2id)
+        let argon2 = Argon2::default();
+        let password_hash = argon2
+            .hash_password(password.as_bytes(), &salt)
+            .map_err(|e| anyhow::anyhow!("password hashing failed: {:?}", e))?;
+        Ok(password_hash.to_string())
+    }
+
+    /// Verify a plaintext password against an encoded Argon2 hash
+    fn verify_password(&self, password: &str, password_hash: &str) -> Result<bool> {
+        let parsed = PasswordHash::new(password_hash)
+            .map_err(|e| anyhow::anyhow!("invalid password hash format: {:?}", e))?;
+        let argon2 = Argon2::default();
+        match argon2.verify_password(password.as_bytes(), &parsed) {
+            Ok(_) => Ok(true),
+            Err(_) => Ok(false),
+        }
     }
 
     /// Helper: parse JSON body into T; on error return a 400 Response
@@ -169,7 +196,7 @@ impl Router {
         stream.finish().await?;
 
         // Log returned JSON
-        debug!(response = %response.into_body(), "Return JSON");
+        info!(response = %response.into_body(), "Return JSON");
 
         Ok(())
     }
@@ -260,10 +287,23 @@ impl Router {
                 .header("content-type", "application/json")
                 .body(json!({"error":"user exists"}).to_string())?);
         }
+
+        // Hash password with Argon2
+        let password_hash = match self.hash_password(&req.password) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::error!("Failed to hash password: {:?}", e);
+                return Ok(Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .header("content-type", "application/json")
+                    .body(json!({"error":"internal"}).to_string())?);
+            }
+        };
+
         let user = User {
             id: Uuid::new_v4(),
             username: req.username,
-            password: req.password,
+            password: password_hash,
             created_at: Utc::now(),
         };
         store.users.push(user.clone());
@@ -292,37 +332,43 @@ impl Router {
         // Try to find user (read lock only)
         let maybe_user = {
             let store = self.store.read();
-            store.users.iter().find(|u| u.username == req.username && u.password == req.password).cloned()
+            store.users.iter().find(|u| u.username == req.username).cloned()
         };
 
         if let Some(user) = maybe_user {
-            debug!("route_login: user found, creating tokens (async)");
-            // Measure time
-            let start = std::time::Instant::now();
+            // Verify password hash
+            match self.verify_password(&req.password, &user.password) {
+                Ok(true) => {
+                    debug!("route_login: password verified, creating tokens (async)");
+                    let start = std::time::Instant::now();
+                    match self.create_tokens_for_user(user.id).await {
+                        Ok((access_token, refresh_token)) => {
+                            let elapsed = start.elapsed();
+                            if elapsed.as_millis() > 200 {
+                                tracing::warn!("token generation slow: {} ms", elapsed.as_millis());
+                            } else {
+                                debug!("token generation took {} ms", elapsed.as_millis());
+                            }
 
-            match self.create_tokens_for_user(user.id).await {
-                Ok((access_token, refresh_token)) => {
-                    let elapsed = start.elapsed();
-                    if elapsed.as_millis() > 200 {
-                        tracing::warn!("token generation slow: {} ms", elapsed.as_millis());
-                    } else {
-                        debug!("token generation took {} ms", elapsed.as_millis());
+                            let payload = serde_json::json!({ "access_token": access_token, "refresh_token": refresh_token });
+                            let body = serde_json::to_string(&payload).unwrap_or_else(|_| "{\"error\":\"serialization_failed\"}".into());
+                            debug!("login response length={} valid_json=true", body.len());
+                            return Ok(Response::builder()
+                                .status(StatusCode::OK)
+                                .header("content-type", "application/json")
+                                .body(body)?);
+                        }
+                        Err(e) => {
+                            tracing::error!("route_login: create_tokens failed: {:?}", e);
+                            return Ok(Response::builder()
+                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                .header("content-type", "application/json")
+                                .body(json!({"error":"token generation failed","details": format!("{:?}", e)}).to_string())?);
+                        }
                     }
-
-                    let payload = serde_json::json!({ "access_token": access_token, "refresh_token": refresh_token });
-                    let body = serde_json::to_string(&payload).unwrap_or_else(|_| "{\"error\":\"serialization_failed\"}".into());
-                    debug!("login response length={} valid_json=true", body.len());
-                    return Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header("content-type", "application/json")
-                        .body(body)?);
                 }
-                Err(e) => {
-                    tracing::error!("route_login: create_tokens failed: {:?}", e);
-                    return Ok(Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .header("content-type", "application/json")
-                        .body(json!({"error":"token generation failed","details": format!("{:?}", e)}).to_string())?);
+                Ok(false) | Err(_) => {
+                    // fallthrough to invalid credentials
                 }
             }
         }
@@ -344,7 +390,7 @@ impl Router {
 
         let rt = match req.refresh_token {
             Some(t) => {
-                debug!("Refresh token: {}", t);
+                info!("Refresh token: {}", t);
                 t
             },
             None => {
