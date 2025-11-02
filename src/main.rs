@@ -7,6 +7,9 @@ use tracing_subscriber::filter::EnvFilter;
 mod routes;
 use routes::Router;
 
+// Bring RngCore into scope so ThreadRng.fill_bytes is available
+use rand::RngCore;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Load .env if present
@@ -19,6 +22,24 @@ async fn main() -> Result<()> {
 
     // Server address
     let addr: SocketAddr = "0.0.0.0:4433".parse()?;
+
+    // Prepare JWT secret: read from SECRET_KEY env or generate ephemeral one.
+    let secret_key: Vec<u8> = match std::env::var("SECRET_KEY") {
+        Ok(s) if !s.is_empty() => {
+            info!("Using SECRET_KEY from environment");
+            s.into_bytes()
+        }
+        _ => {
+            // generate 32 random bytes
+            let mut b = vec![0u8; 32];
+            rand::thread_rng().fill_bytes(&mut b);
+            tracing::warn!("No SECRET_KEY provided — generated ephemeral secret; tokens won't survive restart");
+            b
+        }
+    };
+
+    // Create router with secret
+    let router = Arc::new(Router::new_with_secret(secret_key));
 
     // Try to load cert/key from .env-specified PEM files; fallback to generated self-signed.
     let cert_key = load_certificates_and_key_from_env().or_else(|_| {
@@ -75,9 +96,6 @@ async fn main() -> Result<()> {
     let endpoint = quinn::Endpoint::server(server_config, addr)?;
     info!("Listening on {}", addr);
 
-    // Router contains in-memory "storage" for users & tokens
-    let router = Arc::new(Router::new());
-
     // Accept incoming connections and spawn a task to handle each
     while let Some(connecting) = endpoint.accept().await {
         let router = router.clone();
@@ -94,6 +112,45 @@ async fn main() -> Result<()> {
         });
     }
 
+    Ok(())
+}
+
+async fn handle_connection(conn: quinn::Connection, router: Arc<Router>) -> Result<()> {
+    // Wrap quinn connection in h3_quinn::Connection so it implements h3::quic::Connection
+    let h3_conn = h3_quinn::Connection::new(conn);
+
+    // Build H3 server over the h3_quinn connection using h3 API
+    let server_builder = h3::server::builder();
+    let mut h3_connection = server_builder.build(h3_conn).await?;
+
+    // accept loop
+    let router_task = router.clone();
+    let connection_task = tokio::spawn(async move {
+        loop {
+            tracing::debug!("h3: waiting for next request/resolver");
+            match h3_connection.accept().await {
+                Ok(Some(resolver)) => {
+                    tracing::debug!("h3: resolver received");
+                    let router = router_task.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = router.handle_request(resolver).await {
+                            tracing::error!("Request handling error: {:?}", e);
+                        }
+                    });
+                }
+                Ok(None) => {
+                    tracing::info!("h3: connection closed by peer");
+                    break;
+                }
+                Err(e) => {
+                    tracing::error!("h3 accept error: {:?}", e);
+                    break;
+                }
+            }
+        }
+    });
+
+    connection_task.await?;
     Ok(())
 }
 
@@ -164,40 +221,6 @@ fn try_wrap_pkcs1(key: &[u8]) -> Result<rustls_pki_types::PrivatePkcs1KeyDer<'st
 /// Try to wrap Vec<u8> into PrivateSec1KeyDer
 fn try_wrap_sec1(key: &[u8]) -> Result<rustls_pki_types::PrivateSec1KeyDer<'static>> {
     Ok(rustls_pki_types::PrivateSec1KeyDer::from(key.to_vec()))
-}
-
-async fn handle_connection(conn: quinn::Connection, router: Arc<Router>) -> Result<()> {
-    // Wrap quinn connection in h3_quinn::Connection so it implements h3::quic::Connection
-    let h3_conn = h3_quinn::Connection::new(conn);
-
-    // Build H3 server over the h3_quinn connection using h3 API
-    let server_builder = h3::server::builder();
-    let mut h3_connection = server_builder.build(h3_conn).await?;
-
-    // accept loop
-    let router_task = router.clone();
-    let connection_task = tokio::spawn(async move {
-        loop {
-            match h3_connection.accept().await {
-                Ok(Some(resolver)) => {
-                    let router = router_task.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = router.handle_request(resolver).await {
-                            tracing::error!("Request handling error: {:?}", e);
-                        }
-                    });
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    tracing::error!("h3 accept error: {:?}", e);
-                    break;
-                }
-            }
-        }
-    });
-
-    connection_task.await?;
-    Ok(())
 }
 
 /// Generate a self-signed certificate pair for local testing and return DER bytes.
