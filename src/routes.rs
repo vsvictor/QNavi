@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 use chrono::{Utc, DateTime, Duration as ChronoDuration};
-use tracing::{info, debug, warn};
+use tracing::{info, debug, warn, error};
 
 use h3::server::{RequestResolver, RequestStream};
 
@@ -28,6 +28,7 @@ use redis::aio::MultiplexedConnection;
 use tokio::sync::Mutex;
 
 /// Redis-stored session structure (serialized as JSON)
+/// (kept for potential future metadata storage; current implementation stores raw token string)
 #[derive(Debug, Serialize, Deserialize)]
 struct RedisSession {
     token: String,
@@ -201,8 +202,9 @@ impl Router {
         Ok(())
     }
 
-    // Helper: create JWT access + refresh tokens and persist refresh session into Redis
-    async fn create_tokens_for_user(&self, user_id: Uuid) -> Result<(String, String)> {
+    // Helper: create JWT access + refresh tokens and return also refresh jti + session json.
+    // NOTE: does NOT persist session into Redis. Caller should persist atomically where needed.
+    async fn create_tokens_for_user(&self, user_id: Uuid) -> Result<(String, String, String, String)> {
         let now = Utc::now();
         let iat = now.timestamp() as usize;
         let access_exp = (now + ChronoDuration::seconds(self.access_token_ttl_seconds)).timestamp() as usize;
@@ -244,21 +246,13 @@ impl Router {
         let refresh_elapsed = start_refresh.elapsed();
         debug!("refresh token signed in {} ms", refresh_elapsed.as_millis());
 
-        // Persist refresh session into Redis — key: refresh:<jti>
+        // Prepare session JSON (caller will persist if needed) - kept for compatibility but not used for compare
         let session = RedisSession {
             token: refresh_token.clone(),
             user_id: user_id.to_string(),
             expires_at: (now + ChronoDuration::seconds(self.refresh_token_ttl_seconds)).to_rfc3339(),
         };
-        let key = format!("refresh:{}", jti);
-        let value = serde_json::to_string(&session)?;
-        // Set with expiry (seconds)
-        let ttl_secs = self.refresh_token_ttl_seconds as u64;
-
-        // Lock the multiplexed connection to get mutable access for AsyncCommands
-        let mut conn = self.redis.lock().await;
-        // set_ex expects u64 for seconds
-        let _: () = conn.set_ex(key, value, ttl_secs).await?;
+        let session_json = serde_json::to_string(&session)?;
 
         // warn if entire generation slow
         let total = access_elapsed + rng_elapsed + refresh_elapsed;
@@ -267,7 +261,7 @@ impl Router {
                 total.as_millis(), access_elapsed.as_millis(), rng_elapsed.as_millis(), refresh_elapsed.as_millis());
         }
 
-        Ok((access_token, refresh_token))
+        Ok((access_token, refresh_token, jti, session_json))
     }
 
     async fn route_register(&self, body: &str) -> Result<Response<String>> {
@@ -292,7 +286,7 @@ impl Router {
         let password_hash = match self.hash_password(&req.password) {
             Ok(h) => h,
             Err(e) => {
-                tracing::error!("Failed to hash password: {:?}", e);
+                error!("Failed to hash password: {:?}", e);
                 return Ok(Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
                     .header("content-type", "application/json")
@@ -341,31 +335,38 @@ impl Router {
                 Ok(true) => {
                     debug!("route_login: password verified, creating tokens (async)");
                     let start = std::time::Instant::now();
-                    match self.create_tokens_for_user(user.id).await {
-                        Ok((access_token, refresh_token)) => {
-                            let elapsed = start.elapsed();
-                            if elapsed.as_millis() > 200 {
-                                tracing::warn!("token generation slow: {} ms", elapsed.as_millis());
-                            } else {
-                                debug!("token generation took {} ms", elapsed.as_millis());
-                            }
 
-                            let payload = serde_json::json!({ "access_token": access_token, "refresh_token": refresh_token });
-                            let body = serde_json::to_string(&payload).unwrap_or_else(|_| "{\"error\":\"serialization_failed\"}".into());
-                            debug!("login response length={} valid_json=true", body.len());
-                            return Ok(Response::builder()
-                                .status(StatusCode::OK)
-                                .header("content-type", "application/json")
-                                .body(body)?);
-                        }
+                    // Create tokens (does not persist)
+                    let (access_token, refresh_token, jti, _session_json) = self.create_tokens_for_user(user.id).await?;
+                    let elapsed = start.elapsed();
+                    if elapsed.as_millis() > 200 {
+                        tracing::warn!("token generation slow: {} ms", elapsed.as_millis());
+                    } else {
+                        debug!("token generation took {} ms", elapsed.as_millis());
+                    }
+
+                    // Persist refresh session into Redis: store raw refresh token string as value
+                    let key = format!("refresh:{}", jti);
+                    let ttl_secs = self.refresh_token_ttl_seconds as u64;
+                    let mut conn = self.redis.lock().await;
+                    match conn.set_ex(key.clone(), refresh_token.clone(), ttl_secs).await {
+                        Ok(()) => debug!("redis: stored session key={} (token stored)", key),
                         Err(e) => {
-                            tracing::error!("route_login: create_tokens failed: {:?}", e);
+                            error!("redis: failed to set session key={} error={:?}", key, e);
                             return Ok(Response::builder()
                                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                                 .header("content-type", "application/json")
-                                .body(json!({"error":"token generation failed","details": format!("{:?}", e)}).to_string())?);
+                                .body(json!({"error":"internal","details":"session_store_failed"}).to_string())?);
                         }
-                    }
+                    };
+
+                    let payload = serde_json::json!({ "access_token": access_token, "refresh_token": refresh_token });
+                    let body = serde_json::to_string(&payload).unwrap_or_else(|_| "{\"error\":\"serialization_failed\"}".into());
+                    debug!("login response length={} valid_json=true", body.len());
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json")
+                        .body(body)?);
                 }
                 Ok(false) | Err(_) => {
                     // fallthrough to invalid credentials
@@ -380,6 +381,7 @@ impl Router {
     }
 
     async fn route_refresh(&self, body: &str) -> Result<Response<String>> {
+        info!("Input data:{}", body);
         #[derive(Deserialize)]
         struct Req { refresh_token: Option<String> }
 
@@ -445,80 +447,105 @@ impl Router {
             }
         };
 
-        // Look up session in Redis by jti and validate stored token matches provided rt
-        let jti = token_data.claims.jti.clone();
-        let key = format!("refresh:{}", jti);
-        let mut conn = self.redis.lock().await;
-        let stored_json: Option<String> = conn.get(&key).await?;
-        let stored = match stored_json {
-            Some(s) => {
-                match serde_json::from_str::<RedisSession>(&s) {
-                    Ok(sess) => sess,
-                    Err(_) => {
-                        // malformed data -> remove key and respond unauthorized
-                        let _: () = conn.del(&key).await.unwrap_or(());
-                        return Ok(Response::builder()
-                            .status(StatusCode::UNAUTHORIZED)
-                            .header("content-type", "application/json")
-                            .body(json!({"error":"invalid refresh session"}).to_string())?);
-                    }
-                }
-            }
-            None => {
-                return Ok(Response::builder()
-                    .status(StatusCode::UNAUTHORIZED)
-                    .header("content-type", "application/json")
-                    .body(json!({"error":"invalid refresh session"}).to_string())?);
-            }
-        };
+        // --- Atomic one-time rotation using Redis Lua script ---
+        // old jti/key
+        let old_jti = token_data.claims.jti.clone();
+        let old_key = format!("refresh:{}", old_jti);
 
-        // Ensure the stored token matches provided token (defensive)
-        if stored.token != rt {
-            // possible token reuse or mismatch
-            // for safety, delete stored session
-            let _: () = conn.del(&key).await.unwrap_or(());
-            return Ok(Response::builder()
-                .status(StatusCode::UNAUTHORIZED)
-                .header("content-type", "application/json")
-                .body(json!({"error":"invalid refresh session"}).to_string())?);
-        }
-
-        // parse user id
-        let user_id = match Uuid::parse_str(&stored.user_id) {
+        // parse user id (we could from token_data.claims.sub but will validate again later)
+        let user_id = match Uuid::parse_str(&token_data.claims.sub) {
             Ok(u) => u,
             Err(_) => {
-                let _: () = conn.del(&key).await.unwrap_or(());
                 return Ok(Response::builder()
                     .status(StatusCode::UNAUTHORIZED)
                     .header("content-type", "application/json")
-                    .body(json!({"error":"invalid refresh session"}).to_string())?);
+                    .body(json!({"error":"invalid token subject"}).to_string())?);
             }
         };
 
-        // Now generate new tokens OUTSIDE any lock
-        // Drop lock first to avoid holding Redis connection during token generation
-        drop(conn);
-        let (new_access, new_refresh) = match self.create_tokens_for_user(user_id).await {
+        // Generate new tokens (do NOT persist yet)
+        let (new_access, new_refresh, new_jti, _new_session_json) = match self.create_tokens_for_user(user_id).await {
             Ok(t) => t,
             Err(e) => {
-                tracing::error!("Failed to create rotated tokens: {:?}", e);
+                error!("Failed to create rotated tokens: {:?}", e);
                 return Ok(Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
                     .header("content-type", "application/json")
                     .body(json!({"error":"token generation failed"}).to_string())?);
             }
         };
+        let new_key = format!("refresh:{}", new_jti);
+        let ttl_secs = self.refresh_token_ttl_seconds as u64;
 
-        // Re-acquire connection to remove old session (we already created new one inside create_tokens_for_user)
+        // Lua script to atomically verify old token and swap to new token (store raw token strings)
+        let lua = r#"
+local old = redis.call('GET', KEYS[1])
+if not old then
+  return 0
+end
+if old ~= ARGV[1] then
+  return -1
+end
+redis.call('DEL', KEYS[1])
+redis.call('SET', ARGV[2], ARGV[3], 'EX', tonumber(ARGV[4]))
+return 1
+"#;
+
+        // Execute script: KEYS = [ old_key ], ARGV = [ old_token, new_key, new_token, ttl_secs ]
         let mut conn = self.redis.lock().await;
-        let _: () = conn.del(&key).await.unwrap_or(());
+        let res: i64 = match redis::Script::new(lua)
+            .key(old_key.clone())
+            .arg(rt.clone()) // old token string
+            .arg(new_key.clone())
+            .arg(new_refresh.clone()) // store new raw refresh token as value
+            .arg(ttl_secs)
+            .invoke_async(&mut *conn)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                error!("redis lua error: {:?}", e);
+                return Ok(Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .header("content-type", "application/json")
+                    .body(json!({"error":"internal","details":"session_rotate_failed"}).to_string())?);
+            }
+        };
 
-        let body = json!({ "access_token": new_access, "refresh_token": new_refresh }).to_string();
-        info!("New tokens issued");
-        return Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header("content-type", "application/json")
-            .body(body)?);
+        info!("redis: rotation script result = {}", res);
+
+        match res {
+            1 => {
+                // success
+                let body = json!({ "access_token": new_access, "refresh_token": new_refresh }).to_string();
+                info!("Refresh rotated (atomic)");
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(body)?);
+            }
+            0 => {
+                // old key missing -> expired / not found
+                return Ok(Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .header("content-type", "application/json")
+                    .body(json!({"error":"invalid refresh session"}).to_string())?);
+            }
+            -1 => {
+                // token mismatch -> possible reuse; delete key as defensive step
+                let _: () = conn.del(old_key).await.unwrap_or(());
+                return Ok(Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .header("content-type", "application/json")
+                    .body(json!({"error":"invalid refresh session"}).to_string())?);
+            }
+            _ => {
+                return Ok(Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .header("content-type", "application/json")
+                    .body(json!({"error":"internal"}).to_string())?);
+            }
+        }
     }
 
     // Logout: accept refresh_token, revoke it
@@ -557,6 +584,7 @@ impl Router {
         let mut conn = self.redis.lock().await;
         // remove session
         let deleted: i64 = conn.del(&key).await?;
+        info!("redis: del key={} deleted={}", key, deleted);
         if deleted > 0 {
             return Ok(Response::builder()
                 .status(StatusCode::OK)
