@@ -8,12 +8,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 use chrono::{Utc, DateTime, Duration as ChronoDuration};
-use tracing::{info, debug};
+use tracing::{info, debug, warn};
 
 use h3::server::{RequestResolver, RequestStream};
 
 use jsonwebtoken::{EncodingKey, DecodingKey, Header, Validation, decode, encode, TokenData};
 use rand::RngCore;
+use rand::rngs::OsRng;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 
 #[derive(Clone)]
 pub struct Router {
@@ -140,7 +143,7 @@ impl Router {
             ("POST", "/login") => self.route_login(&body_str).await?,
             ("POST", "/refresh") => self.route_refresh(&body_str).await?,
             ("POST", "/logout") => self.route_logout(&body_str).await?,
-            ("GET", "/getprofile") => self.route_getprofile(req.headers()).await?,
+            ("GET", "/profile") => self.route_getprofile(req.headers()).await?,
             _ => Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .header("content-type", "application/json")
@@ -176,20 +179,35 @@ impl Router {
             exp: access_exp,
             iat,
         };
-        let access_token = encode(&Header::default(), &access_claims, &self.encoding_key())?;
 
-        // Refresh token with jti
+        // measure signing/access token generation
+        let start_access = std::time::Instant::now();
+        let access_token = encode(&Header::default(), &access_claims, &self.encoding_key())?;
+        let access_elapsed = start_access.elapsed();
+        debug!("access token signed in {} ms", access_elapsed.as_millis());
+
+        // Refresh token with jti — use OsRng to avoid potential blocking on thread_rng
+        let start_rng = std::time::Instant::now();
         let mut jti_bytes = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut jti_bytes);
+        OsRng.fill_bytes(&mut jti_bytes);
+        let rng_elapsed = start_rng.elapsed();
+        debug!("jti RNG in {} ms", rng_elapsed.as_millis());
+        if rng_elapsed.as_millis() > 200 {
+            warn!("RNG took unusually long: {} ms", rng_elapsed.as_millis());
+        }
         let jti = hex::encode(jti_bytes);
 
+        // build refresh claims and sign
         let refresh_claims = RefreshClaims {
             sub: user_id.to_string(),
             exp: refresh_exp,
             iat,
             jti: jti.clone(),
         };
+        let start_refresh = std::time::Instant::now();
         let refresh_token = encode(&Header::default(), &refresh_claims, &self.encoding_key())?;
+        let refresh_elapsed = start_refresh.elapsed();
+        debug!("refresh token signed in {} ms", refresh_elapsed.as_millis());
 
         // Persist refresh session — hold write lock only briefly
         {
@@ -200,6 +218,13 @@ impl Router {
                 user_id,
                 expires_at: (now + ChronoDuration::seconds(self.refresh_token_ttl_seconds)),
             });
+        }
+
+        // warn if entire generation slow
+        let total = access_elapsed + rng_elapsed + refresh_elapsed;
+        if total.as_millis() > 500 {
+            warn!("token generation total slow: {} ms (access {} ms, rng {} ms, refresh {} ms)",
+                total.as_millis(), access_elapsed.as_millis(), rng_elapsed.as_millis(), refresh_elapsed.as_millis());
         }
 
         Ok((access_token, refresh_token))
@@ -251,47 +276,41 @@ impl Router {
 
         debug!("route_login: parsed req for {}", req.username);
 
-        // Try to find user
+        // Try to find user (read lock only)
         let maybe_user = {
             let store = self.store.read();
             store.users.iter().find(|u| u.username == req.username && u.password == req.password).cloned()
         };
 
         if let Some(user) = maybe_user {
-            debug!("route_login: user found, creating tokens");
-            // create tokens but protect with timeout
-            match tokio::time::timeout(std::time::Duration::from_secs(5), tokio::task::spawn_blocking({
-                let this = self.clone();
-                move || this.create_tokens_for_user(user.id)
-            })).await {
-                Ok(Ok(Ok((access_token, refresh_token)))) => {
-                    let body = json!({ "access_token": access_token, "refresh_token": refresh_token }).to_string();
-                    debug!("route_login: tokens created");
+            debug!("route_login: user found, creating tokens (sync)");
+            // Measure time
+            let start = std::time::Instant::now();
+
+            // Synchronous creation (should be fast). Avoid spawn_blocking unless you observe heavy CPU work.
+            match self.create_tokens_for_user(user.id) {
+                Ok((access_token, refresh_token)) => {
+                    let elapsed = start.elapsed();
+                    if elapsed.as_millis() > 200 {
+                        tracing::warn!("token generation slow: {} ms", elapsed.as_millis());
+                    } else {
+                        debug!("token generation took {} ms", elapsed.as_millis());
+                    }
+
+                    let payload = serde_json::json!({ "access_token": access_token, "refresh_token": refresh_token });
+                    let body = serde_json::to_string(&payload).unwrap_or_else(|_| "{\"error\":\"serialization_failed\"}".into());
+                    debug!("login response length={} valid_json=true", body.len());
                     return Ok(Response::builder()
                         .status(StatusCode::OK)
                         .header("content-type", "application/json")
                         .body(body)?);
                 }
-                Ok(Ok(Err(e))) => {
+                Err(e) => {
                     tracing::error!("route_login: create_tokens failed: {:?}", e);
                     return Ok(Response::builder()
                         .status(StatusCode::INTERNAL_SERVER_ERROR)
                         .header("content-type", "application/json")
                         .body(json!({"error":"token generation failed","details": format!("{:?}", e)}).to_string())?);
-                }
-                Ok(Err(join_err)) => {
-                    tracing::error!("route_login: spawn_blocking join error: {:?}", join_err);
-                    return Ok(Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .header("content-type", "application/json")
-                        .body(json!({"error":"internal"}).to_string())?);
-                }
-                Err(_) => {
-                    tracing::error!("route_login: create_tokens timed out");
-                    return Ok(Response::builder()
-                        .status(StatusCode::GATEWAY_TIMEOUT)
-                        .header("content-type", "application/json")
-                        .body(json!({"error":"token generation timeout"}).to_string())?);
                 }
             }
         }
@@ -325,11 +344,43 @@ impl Router {
             }
         };
 
-        // decode refresh token
+        // decode refresh token (validate signature & exp)
         let token_data: TokenData<RefreshClaims> = match decode::<RefreshClaims>(&rt, &self.decoding_key(), &Validation::default()) {
             Ok(td) => td,
             Err(e) => {
                 tracing::warn!("Invalid refresh token: {:?}", e);
+
+                // Diagnostic: manually parse JWT payload without signature verification.
+                match rt.split('.').collect::<Vec<&str>>().as_slice() {
+                    [hdr_b64, payload_b64, _sig_b64] => {
+                        // base64 URL decode payload
+                        match URL_SAFE_NO_PAD.decode(payload_b64) {
+                            Ok(payload_bytes) => {
+                                match serde_json::from_slice::<RefreshClaims>(&payload_bytes) {
+                                    Ok(claims) => {
+                                        tracing::info!("Insecurely parsed refresh claims (no sig check): {:?}", claims);
+                                    }
+                                    Err(e) => {
+                                        tracing::info!("Parsed JWT payload but failed to deserialize into RefreshClaims: {:?}", e);
+                                        tracing::debug!("JWT payload (raw): {}", String::from_utf8_lossy(&payload_bytes));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::info!("Failed to base64-decode JWT payload for diagnostics: {:?}", e);
+                            }
+                        }
+
+                        // Optionally inspect header too (helpful to check alg)
+                        if let Ok(hdr_bytes) = URL_SAFE_NO_PAD.decode(hdr_b64) {
+                            tracing::debug!("JWT header (raw): {}", String::from_utf8_lossy(&hdr_bytes));
+                        }
+                    }
+                    _ => {
+                        tracing::info!("Token does not look like a JWT (expected three dot-separated parts)");
+                    }
+                }
+
                 return Ok(Response::builder()
                     .status(StatusCode::UNAUTHORIZED)
                     .header("content-type", "application/json")
@@ -337,36 +388,98 @@ impl Router {
             }
         };
 
-        // Validate session exists and jti matches and not expired
-        let mut store = self.store.write();
-        if let Some(sess) = store.sessions.iter_mut().find(|s| s.refresh_jti == token_data.claims.jti && s.token == rt) {
-            if sess.expires_at <= Utc::now() {
-                // remove expired
-                store.sessions.retain(|s| s.refresh_jti != token_data.claims.jti);
+        // --- IMPORTANT: avoid holding write lock while generating tokens ---
+        // Find the session and check expiry under lock, but copy out the minimal data then drop lock.
+        let (found_user_id, found_jti) = {
+            let store = self.store.read();
+            match store.sessions.iter().find(|s| s.refresh_jti == token_data.claims.jti && s.token == rt) {
+                Some(sess) => {
+                    if sess.expires_at <= Utc::now() {
+                        // expired; will remove below under write lock
+                        (None, None)
+                    } else {
+                        (Some(sess.user_id), Some(sess.refresh_jti.clone()))
+                    }
+                }
+                None => (None, None),
+            }
+        };
+
+        // If not found or expired -> respond
+        let user_id = match found_user_id {
+            Some(uid) => uid,
+            None => {
+                // If expired, remove expired matching jti (best-effort)
+                let _ = {
+                    let mut store = self.store.write();
+                    store.sessions.retain(|s| s.refresh_jti != token_data.claims.jti);
+                };
                 return Ok(Response::builder()
                     .status(StatusCode::UNAUTHORIZED)
                     .header("content-type", "application/json")
-                    .body(json!({"error":"refresh token expired"}).to_string())?);
+                    .body(json!({"error":"invalid refresh session"}).to_string())?);
             }
+        };
+        let old_jti = found_jti.unwrap();
 
-            // issue new access token (and optionally rotate refresh token)
-            let user_id = sess.user_id;
-            // Simple rotation: create new refresh token and replace session
-            let (new_access, new_refresh) = self.create_tokens_for_user(user_id)?;
-            // remove old session with same jti
-            store.sessions.retain(|s| s.refresh_jti != token_data.claims.jti);
+        // Now generate new tokens OUTSIDE the lock
+        let (new_access, new_refresh) = match self.create_tokens_for_user(user_id) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!("Failed to create rotated tokens: {:?}", e);
+                return Ok(Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .header("content-type", "application/json")
+                    .body(json!({"error":"token generation failed"}).to_string())?);
+            }
+        };
 
-            let body = json!({ "access_token": new_access, "refresh_token": new_refresh }).to_string();
-            return Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", "application/json")
-                .body(body)?);
+        // Re-acquire write lock briefly to remove old session and ensure new session is stored
+        {
+            let mut store = self.store.write();
+            // Remove old session(s) matching old_jti (defensive)
+            store.sessions.retain(|s| s.refresh_jti != old_jti);
+            // Add new session that was appended inside create_tokens_for_user already.
+            // Note: create_tokens_for_user already appends a session with the new refresh_jti.
+            // But to be robust in case of race or different behavior, ensure new token is present:
+            // (we check presence and push if missing)
+            let new_refresh_jti = match new_refresh.split('.').collect::<Vec<&str>>().as_slice() {
+                [_, payload_b64, _] => {
+                    if let Ok(payload_bytes) = URL_SAFE_NO_PAD.decode(payload_b64) {
+                        if let Ok(claims) = serde_json::from_slice::<RefreshClaims>(&payload_bytes) {
+                            Some(claims.jti)
+                        } else { None }
+                    } else { None }
+                }
+                _ => None,
+            };
+            if let Some(jti) = new_refresh_jti {
+                if !store.sessions.iter().any(|s| s.refresh_jti == jti) {
+                    // add
+                    store.sessions.push(Session {
+                        refresh_jti: jti.clone(),
+                        token: new_refresh.clone(),
+                        user_id,
+                        expires_at: Utc::now() + ChronoDuration::seconds(self.refresh_token_ttl_seconds),
+                    });
+                }
+            } else {
+                // fallback: push without jti (shouldn't happen)
+                store.sessions.push(Session {
+                    refresh_jti: format!("rt-{}", Uuid::new_v4()),
+                    token: new_refresh.clone(),
+                    user_id,
+                    expires_at: Utc::now() + ChronoDuration::seconds(self.refresh_token_ttl_seconds),
+                });
+            }
         }
 
-        Ok(Response::builder()
-            .status(StatusCode::UNAUTHORIZED)
+        let body = json!({ "access_token": new_access, "refresh_token": new_refresh }).to_string();
+        info!("New tokens issued");
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
             .header("content-type", "application/json")
-            .body(json!({"error":"invalid refresh session"}).to_string())?)
+            .body(body)?);
     }
 
     // Logout: accept refresh_token, revoke it

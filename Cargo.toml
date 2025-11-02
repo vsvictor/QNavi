@@ -43,6 +43,7 @@ chrono = { version = "0.4", features = ["serde"] }
 
 parking_lot = "0.12"
 hex = "0.4.3"
+base64 = "0.21.7"
 
 [profile.dev]
 overflow-checks = true
